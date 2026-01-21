@@ -16,7 +16,6 @@ A Wireshark protocol dissector for analyzing RBus (RDK Bus) messaging traffic.
   - [Usage](#usage)
     - [Capturing RBus Traffic](#capturing-rbus-traffic)
       - [TCP Capture (Direct)](#tcp-capture-direct)
-      - [Unix Domain Socket Capture (May not work on MacOS)](#unix-domain-socket-capture-may-not-work-on-macos)
     - [Display Filters](#display-filters)
       - [Header Filters](#header-filters)
       - [Flag Filters](#flag-filters)
@@ -143,24 +142,6 @@ wireshark -i lo0 -k -f "tcp port 10002"
 # Use rbuscli to generate some traffic
 rbuscli discallcomponents
 rbuscli get Device.DeviceInfo.
-```
-
-#### Unix Domain Socket Capture (May not work on MacOS)
-
-Wireshark 3.0+ can capture Unix socket traffic directly:
-
-```bash
-# List available Unix sockets
-dumpcap -D
-
-# Capture specific socket
-dumpcap -i unix:///tmp/rtrouted -w rbus.pcap
-
-# Open in Wireshark
-wireshark rbus.pcap
-
-# Or use Wireshark directly
-wireshark -i unix:///tmp/rtrouted -k
 ```
 
 ### Display Filters
