@@ -116,6 +116,8 @@ Verify installation by checking Wireshark → About → Plugins. You should see 
 
 ### Capturing RBus Traffic
 
+**Important:** Before restarting `rtrouted` with TCP transport, ensure all running RBus clients are stopped. This includes processes like `rbus-elements`, `rbuscli`, or any other components connected to the RBus daemon.
+
 #### TCP Capture (Direct)
 
 Start RBus using TCP transport:
@@ -127,6 +129,8 @@ sudo sh -c 'echo "tcp://127.0.0.1:10002" > /etc/rbus_client.conf'
 # Start RBus using the default rbus plugin port (-f keeps rtrouted in the foreground)
 rtrouted -f -s tcp://127.0.0.1:10002
 
+# Restart any clients like rbus-elements
+
 # Capture to a file on default port 10002
 tcpdump -i lo -w rbus.pcap tcp port 10002
 
@@ -135,6 +139,10 @@ wireshark rbus.pcap
 
 # Or use Wireshark directly
 wireshark -i lo0 -k -f "tcp port 10002"
+
+# Use rbuscli to generate some traffic
+rbuscli discallcomponents
+rbuscli get Device.DeviceInfo.
 ```
 
 #### Unix Domain Socket Capture (May not work on MacOS)
