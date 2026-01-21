@@ -110,7 +110,7 @@ The plugin will be installed to the Wireshark plugin directory:
 - Linux: `~/.local/lib/wireshark/plugins/` or `/usr/lib/wireshark/plugins/`
 - macOS: `~/.local/lib/wireshark/plugins/` or `/Applications/Wireshark.app/Contents/PlugIns/wireshark/`
 
-Verify installation by checking Wireshark → Help → About → Plugins. You should see "rbus" listed.
+Verify installation by checking Wireshark → About → Plugins. You should see "rbus" listed.
 
 ## Usage
 
