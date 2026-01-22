@@ -48,34 +48,24 @@ RBus is a lightweight messaging system used for inter-process communication (IPC
 
 ### Build Dependencies
 
-- **Wireshark Development Headers** (3.0.0 or later)
-  - Ubuntu/Debian: `sudo apt-get install wireshark-dev libwireshark-dev`
-  - Fedora/RHEL: `sudo dnf install wireshark-devel`
+- **Wireshark Development Headers** (4.6.3 or later)
   - macOS: `brew install wireshark` (includes headers)
 
 - **GLib 2.0** (2.32.0 or later)
-  - Ubuntu/Debian: `sudo apt-get install libglib2.0-dev`
-  - Fedora/RHEL: `sudo dnf install glib2-devel`
   - macOS: `brew install glib`
 
 - **CMake** (3.10 or later)
-  - Ubuntu/Debian: `sudo apt-get install cmake`
-  - Fedora/RHEL: `sudo dnf install cmake`
   - macOS: `brew install cmake`
 
 - **pkg-config**
-  - Ubuntu/Debian: `sudo apt-get install pkg-config`
-  - Fedora/RHEL: `sudo dnf install pkgconfig`
   - macOS: `brew install pkg-config`
 
 - **MessagePack** (optional, for payload decoding)
-  - Ubuntu/Debian: `sudo apt-get install libmsgpack-dev`
-  - Fedora/RHEL: `sudo dnf install msgpack-devel`
   - macOS: `brew install msgpack`
 
 ### Runtime Dependencies
 
-- Wireshark 3.0.0 or later
+- Wireshark 4.6.3 or later
 
 ## Building
 
