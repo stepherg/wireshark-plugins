@@ -16,6 +16,7 @@ A Wireshark protocol dissector for analyzing RBus (RDK Bus) messaging traffic.
   - [Usage](#usage)
     - [Capturing RBus Traffic](#capturing-rbus-traffic)
       - [TCP Capture (Direct)](#tcp-capture-direct)
+      - [TCP Capture (Remote Device)](#tcp-capture-remote-device)
     - [Display Filters](#display-filters)
       - [Header Filters](#header-filters)
       - [Flag Filters](#flag-filters)
@@ -96,7 +97,6 @@ cmake -DCMAKE_BUILD_TYPE=Debug ..
 ## Installation
 
 The plugin will be installed to the Wireshark plugin directory:
-- Linux: `~/.local/lib/wireshark/plugins/` or `/usr/lib/wireshark/plugins/`
 - macOS: `~/.local/lib/wireshark/plugins/` or `/Applications/Wireshark.app/Contents/PlugIns/wireshark/`
 
 Verify installation by checking Wireshark → About → Plugins. You should see "rbus" listed.
@@ -133,6 +133,32 @@ wireshark -i lo0 -k -f "tcp port 10002"
 rbuscli discallcomponents
 rbuscli get Device.DeviceInfo.
 ```
+
+#### TCP Capture (Remote Device)
+
+From remote device:
+```bash
+# Edit /lib/systemd/system/rbus.service and set ExecStart to:
+# ExecStart=/usr/bin/rtrouted -s tcp://127.0.0.1:10002
+# Create the client configuration:
+echo "tcp://127.0.0.1:10002" > /etc/rbus_client.conf
+
+# Reboot the device
+reboot
+```
+
+From MacOS:
+```bash
+# Create a tunnel (forwards remote port 10002 to local port 10002)
+ssh -L 10002:127.0.0.1:10002 root@remote-device
+
+# Or -- create the tunnel in the background with -N (no remote command) and -f (background)
+ssh -N -f -L 10002:127.0.0.1:10002 root@remote-device
+
+# Start tcpdump on remote device and start wirkshark on MacOS
+ssh root@remote-device 'tcpdump -i lo -U -s0 -w - "tcp port 10002"' | wireshark -k -i -
+```
+
 
 ### Display Filters
 
