@@ -134,6 +134,31 @@ static int hf_rbus_object_property = -1;
 static int hf_rbus_object_property_name = -1;
 static int hf_rbus_object_property_namevalue = -1;
 
+/* Control message fields */
+static int hf_rbus_control_message_type = -1;
+static int hf_rbus_control_add = -1;
+static int hf_rbus_control_topic = -1;
+static int hf_rbus_control_route_id = -1;
+static int hf_rbus_control_expression = -1;
+static int hf_rbus_control_result = -1;
+static int hf_rbus_control_count = -1;
+static int hf_rbus_control_item = -1;
+static int hf_rbus_advisory_event = -1;
+static int hf_rbus_advisory_inbox = -1;
+static int hf_rbus_diag_command = -1;
+
+/* Event metadata fields (different from standard metadata) */
+static int hf_rbus_event_object_name = -1;
+static int hf_rbus_event_is_rbus2 = -1;
+
+/* Element type and access fields */
+static int hf_rbus_element_type = -1;
+static int hf_rbus_element_access = -1;
+static int hf_rbus_discovery_depth = -1;
+static int hf_rbus_discovery_row_names_only = -1;
+static int hf_rbus_table_instance = -1;
+static int hf_rbus_table_alias = -1;
+
 /* Subtree indices */
 static gint ett_rbus = -1;
 static gint ett_rbus_header = -1;
@@ -142,6 +167,8 @@ static gint ett_rbus_flags = -1;
 static gint ett_rbus_parameter = -1;
 static gint ett_rbus_property = -1;
 static gint ett_rbus_metadata = -1;
+static gint ett_rbus_control = -1;
+static gint ett_rbus_event_metadata = -1;
 
 /* RBus Event Type IDs */
 static const value_string rbus_event_type_vals[] = {
@@ -152,6 +179,35 @@ static const value_string rbus_event_type_vals[] = {
     { 4, "INITIAL_VALUE" },
     { 5, "INTERVAL" },
     { 6, "DURATION_COMPLETE" },
+    { 0, NULL }
+};
+
+/* RBus Element Type IDs (for discovery responses) */
+static const value_string rbus_element_type_vals[] = {
+    { 0, "PROPERTY" },
+    { 1, "TABLE" },
+    { 2, "EVENT" },
+    { 3, "METHOD" },
+    { 0, NULL }
+};
+
+/* Advisory Event Types */
+static const value_string rbus_advisory_event_vals[] = {
+    { 0, "CLIENT_CONNECT" },
+    { 1, "CLIENT_DISCONNECT" },
+    { 0, NULL }
+};
+
+/* Control Message Types */
+static const value_string rbus_control_msg_type_vals[] = {
+    { 0, "SUBSCRIBE" },
+    { 1, "UNSUBSCRIBE" },
+    { 2, "QUERY" },
+    { 3, "ENUMERATE" },
+    { 4, "TRACE_ORIGIN" },
+    { 5, "REGISTERED_COMPONENTS" },
+    { 6, "ADVISORY" },
+    { 7, "DIAGNOSTIC" },
     { 0, NULL }
 };
 
@@ -649,6 +705,180 @@ dissect_msgpack_value(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
 }
 
 /*
+ * Check if a topic is a control message topic
+ * Returns control message type or -1 if not a control topic
+ */
+static gint
+get_control_message_type(const guint8* topic_str) {
+   if (!topic_str) return -1;
+   
+   const char* topic = (const char*)topic_str;
+   
+   /* Check for router control topics */
+   if (strstr(topic, "_RTROUTED.INBOX.SUBSCRIBE") != NULL) {
+      return 0; /* SUBSCRIBE */
+   }
+   if (strstr(topic, "_RTROUTED.INBOX.QUERY") != NULL) {
+      return 2; /* QUERY */
+   }
+   if (strcmp(topic, "_enumerate_elements") == 0) {
+      return 3; /* ENUMERATE */
+   }
+   if (strcmp(topic, "_trace_origin_object") == 0) {
+      return 4; /* TRACE_ORIGIN */
+   }
+   if (strcmp(topic, "_registered_components") == 0) {
+      return 5; /* REGISTERED_COMPONENTS */
+   }
+   if (strstr(topic, "_RTROUTED.ADVISORY") != NULL) {
+      return 6; /* ADVISORY */
+   }
+   if (strstr(topic, "_RTROUTED.INBOX.DIAG") != NULL) {
+      return 7; /* DIAGNOSTIC */
+   }
+   
+   return -1;
+}
+
+/*
+ * Parse control message JSON payload
+ * Control messages use JSON encoding (not MessagePack)
+ */
+static guint
+parse_control_message(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
+   guint offset, guint payload_length, gint control_type) {
+   
+   /* Get JSON data */
+   const guint8* json_data = tvb_get_ptr(tvb, offset, payload_length);
+   gchar* json_str = (gchar*)wmem_alloc(pinfo->pool, payload_length + 1);
+   memcpy(json_str, json_data, payload_length);
+   json_str[payload_length] = '\0';
+   
+   /* Create control message subtree */
+   proto_item* ctrl_item = proto_tree_add_item(tree, hf_rbus_control_message_type, tvb, offset, 1, ENC_NA);
+   proto_item_set_text(ctrl_item, "Control Message: %s", 
+      val_to_str(pinfo->pool, control_type, rbus_control_msg_type_vals, "Unknown (%d)"));
+   proto_tree* ctrl_tree = proto_item_add_subtree(ctrl_item, ett_rbus_control);
+   
+   /* Parse common JSON fields - simple string search for key-value pairs */
+   /* This is a lightweight JSON parser for the expected control message format */
+   
+   /* Look for "add" field (subscribe/unsubscribe) */
+   const char* add_pos = strstr(json_str, "\"add\"");
+   if (add_pos) {
+      const char* colon = strchr(add_pos, ':');
+      if (colon) {
+         gint add_val = atoi(colon + 1);
+         proto_tree_add_int(ctrl_tree, hf_rbus_control_add, tvb, offset, payload_length, add_val);
+      }
+   }
+   
+   /* Look for "topic" field */
+   const char* topic_pos = strstr(json_str, "\"topic\"");
+   if (topic_pos) {
+      const char* colon = strchr(topic_pos, ':');
+      if (colon) {
+         const char* quote_start = strchr(colon, '"');
+         if (quote_start) {
+            quote_start++;
+            const char* quote_end = strchr(quote_start, '"');
+            if (quote_end) {
+               gchar* topic_val = wmem_strndup(pinfo->pool, quote_start, quote_end - quote_start);
+               proto_tree_add_string(ctrl_tree, hf_rbus_control_topic, tvb, offset, payload_length, topic_val);
+            }
+         }
+      }
+   }
+   
+   /* Look for "expression" field (discovery) */
+   const char* expr_pos = strstr(json_str, "\"expression\"");
+   if (expr_pos) {
+      const char* colon = strchr(expr_pos, ':');
+      if (colon) {
+         const char* quote_start = strchr(colon, '"');
+         if (quote_start) {
+            quote_start++;
+            const char* quote_end = strchr(quote_start, '"');
+            if (quote_end) {
+               gchar* expr_val = wmem_strndup(pinfo->pool, quote_start, quote_end - quote_start);
+               proto_tree_add_string(ctrl_tree, hf_rbus_control_expression, tvb, offset, payload_length, expr_val);
+            }
+         }
+      }
+   }
+   
+   /* Look for "result" field */
+   const char* result_pos = strstr(json_str, "\"result\"");
+   if (result_pos) {
+      const char* colon = strchr(result_pos, ':');
+      if (colon) {
+         gint result_val = atoi(colon + 1);
+         proto_tree_add_int(ctrl_tree, hf_rbus_control_result, tvb, offset, payload_length, result_val);
+      }
+   }
+   
+   /* Look for "count" field */
+   const char* count_pos = strstr(json_str, "\"count\"");
+   if (count_pos) {
+      const char* colon = strchr(count_pos, ':');
+      if (colon) {
+         guint32 count_val = (guint32)atoi(colon + 1);
+         proto_tree_add_uint(ctrl_tree, hf_rbus_control_count, tvb, offset, payload_length, count_val);
+      }
+   }
+   
+   /* Look for "event" field (advisory) */
+   const char* event_pos = strstr(json_str, "\"event\"");
+   if (event_pos) {
+      const char* colon = strchr(event_pos, ':');
+      if (colon) {
+         gint event_val = atoi(colon + 1);
+         proto_tree_add_int(ctrl_tree, hf_rbus_advisory_event, tvb, offset, payload_length, event_val);
+      }
+   }
+   
+   /* Look for "inbox" field (advisory) */
+   const char* inbox_pos = strstr(json_str, "\"inbox\"");
+   if (inbox_pos) {
+      const char* colon = strchr(inbox_pos, ':');
+      if (colon) {
+         const char* quote_start = strchr(colon, '"');
+         if (quote_start) {
+            quote_start++;
+            const char* quote_end = strchr(quote_start, '"');
+            if (quote_end) {
+               gchar* inbox_val = wmem_strndup(pinfo->pool, quote_start, quote_end - quote_start);
+               proto_tree_add_string(ctrl_tree, hf_rbus_advisory_inbox, tvb, offset, payload_length, inbox_val);
+            }
+         }
+      }
+   }
+   
+   /* Look for diagnostic command key */
+   const char* diag_pos = strstr(json_str, "_RTROUTED.INBOX.DIAG.KEY");
+   if (diag_pos) {
+      const char* colon = strchr(diag_pos, ':');
+      if (colon) {
+         const char* quote_start = strchr(colon, '"');
+         if (quote_start) {
+            quote_start++;
+            const char* quote_end = strchr(quote_start, '"');
+            if (quote_end) {
+               gchar* diag_val = wmem_strndup(pinfo->pool, quote_start, quote_end - quote_start);
+               proto_tree_add_string(ctrl_tree, hf_rbus_diag_command, tvb, offset, payload_length, diag_val);
+            }
+         }
+      }
+   }
+   
+   /* Display raw JSON */
+   proto_tree_add_bytes_format_value(ctrl_tree, hf_rbus_payload, tvb, offset,
+      payload_length, NULL, "%s", json_str);
+   
+   return payload_length;
+}
+
+/*
  * Parse structured RBus message payload with dedicated fields
  * Returns the number of bytes consumed
  */
@@ -821,6 +1051,50 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
             idx++;
          }
 
+         /* Event Metadata: [eventName, objectName, isRbus2, offset]
+          * This is DIFFERENT from the standard [method, ot_parent, ot_state, offset] */
+         if (idx + 3 < object_count) {
+            proto_item* meta_item = proto_tree_add_item(tree, hf_rbus_metadata, tvb, offset, 1, ENC_NA);
+            proto_tree* meta_tree = proto_item_add_subtree(meta_item, ett_rbus_event_metadata);
+            proto_item_set_text(meta_item, "Event Metadata");
+            
+            /* eventName (repeated) */
+            if (array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+               gchar* meta_event = wmem_strdup_printf(pinfo->pool, "%.*s",
+                  (int)array_ptr[idx].via.str.size,
+                  array_ptr[idx].via.str.ptr);
+               proto_tree_add_string(meta_tree, hf_rbus_event_name, tvb, offset, 1, meta_event);
+               idx++;
+            }
+            
+            /* objectName (publishing component) */
+            if (idx < object_count && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+               gchar* object_name = wmem_strdup_printf(pinfo->pool, "%.*s",
+                  (int)array_ptr[idx].via.str.size,
+                  array_ptr[idx].via.str.ptr);
+               proto_tree_add_string(meta_tree, hf_rbus_event_object_name, tvb, offset, 1, object_name);
+               idx++;
+            }
+            
+            /* isRbus2 flag */
+            if (idx < object_count && array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+               proto_tree_add_uint(meta_tree, hf_rbus_event_is_rbus2, tvb, offset, 1, 
+                  (guint32)array_ptr[idx].via.u64);
+               idx++;
+            }
+            
+            /* offset (fixed 32-bit) */
+            if (idx < object_count) {
+               gint32 offset_val = 0;
+               if (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                  offset_val = (gint32)array_ptr[idx].via.u64;
+               } else if (array_ptr[idx].type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+                  offset_val = (gint32)array_ptr[idx].via.i64;
+               }
+               proto_tree_add_int(meta_tree, hf_rbus_metadata_offset, tvb, offset, 1, offset_val);
+            }
+         }
+
          msgpack_unpacked_destroy(&msg);
          return payload_length;
       }
@@ -984,30 +1258,33 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
          idx++;
       }
    } else if (strcmp(method, "METHOD_GETPARAMETERNAMES") == 0) {
-      /* GETPARAMETERNAMES Request: [componentName, paramName, nextLevel] */
+      /* GETPARAMETERNAMES/Discovery Request: [objectName, depth, getRowNamesOnly, method, ...] */
       guint idx = 0;
 
-      /* Component name */
+      /* Object name (root for discovery) */
       if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-         gchar* comp = wmem_strdup_printf(pinfo->pool, "%.*s",
+         gchar* obj_name = wmem_strdup_printf(pinfo->pool, "%.*s",
             (int)array_ptr[idx].via.str.size,
             array_ptr[idx].via.str.ptr);
-         proto_tree_add_string(tree, hf_rbus_component_name, tvb, offset, 1, comp);
+         proto_tree_add_string(tree, hf_rbus_parameter_name, tvb, offset, 1, obj_name);
          idx++;
       }
 
-      /* Parameter name (path for discovery) */
-      if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-         gchar* param = wmem_strdup_printf(pinfo->pool, "%.*s",
-            (int)array_ptr[idx].via.str.size,
-            array_ptr[idx].via.str.ptr);
-         proto_tree_add_string(tree, hf_rbus_parameter_name, tvb, offset, 1, param);
+      /* Discovery depth (0=single level, -1=unlimited) */
+      if (idx < (guint)method_idx) {
+         gint32 depth = 0;
+         if (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+            depth = (gint32)array_ptr[idx].via.u64;
+         } else if (array_ptr[idx].type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+            depth = (gint32)array_ptr[idx].via.i64;
+         }
+         proto_tree_add_int(tree, hf_rbus_discovery_depth, tvb, offset, 1, depth);
          idx++;
       }
 
-      /* Next level flag */
+      /* Get row names only flag (1=table rows only, 0=all elements) */
       if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
-         proto_tree_add_uint(tree, hf_rbus_param_count, tvb, offset, 1,
+         proto_tree_add_uint(tree, hf_rbus_discovery_row_names_only, tvb, offset, 1,
             (guint32)array_ptr[idx].via.u64);
          idx++;
       }
@@ -1038,8 +1315,8 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
          }
          idx++;
       }
-   } else if (strcmp(method, "METHOD_ADDTBLROW") == 0 || strcmp(method, "METHOD_DELETETBLROW") == 0) {
-      /* Table row operations: [sessionId, componentName, tableName, alias/rowIndex] */
+   } else if (strcmp(method, "METHOD_ADDTBLROW") == 0) {
+      /* Add Table Row: [sessionId, tableName, aliasName, method, ...] */
       guint idx = 0;
 
       /* Session ID */
@@ -1049,16 +1326,7 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
          idx++;
       }
 
-      /* Component name */
-      if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-         gchar* comp = wmem_strdup_printf(pinfo->pool, "%.*s",
-            (int)array_ptr[idx].via.str.size,
-            array_ptr[idx].via.str.ptr);
-         proto_tree_add_string(tree, hf_rbus_component_name, tvb, offset, 1, comp);
-         idx++;
-      }
-
-      /* Table name */
+      /* Table name (must end with period) */
       if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
          gchar* table = wmem_strdup_printf(pinfo->pool, "%.*s",
             (int)array_ptr[idx].via.str.size,
@@ -1067,17 +1335,31 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
          idx++;
       }
 
-      /* Alias or row index */
-      if (idx < (guint)method_idx) {
-         if (array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-            gchar* alias = wmem_strdup_printf(pinfo->pool, "%.*s",
-               (int)array_ptr[idx].via.str.size,
-               array_ptr[idx].via.str.ptr);
-            proto_tree_add_string(tree, hf_rbus_parameter_name, tvb, offset, 1, alias);
-         } else if (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
-            proto_tree_add_uint(tree, hf_rbus_param_count, tvb, offset, 1,
-               (guint32)array_ptr[idx].via.u64);
-         }
+      /* Alias Name (optional, can be empty string) */
+      if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+         gchar* alias = wmem_strdup_printf(pinfo->pool, "%.*s",
+            (int)array_ptr[idx].via.str.size,
+            array_ptr[idx].via.str.ptr);
+         proto_tree_add_string(tree, hf_rbus_table_alias, tvb, offset, 1, alias);
+         idx++;
+      }
+   } else if (strcmp(method, "METHOD_DELETETBLROW") == 0) {
+      /* Delete Table Row: [sessionId, rowName, method, ...] */
+      guint idx = 0;
+
+      /* Session ID */
+      if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+         proto_tree_add_uint(tree, hf_rbus_session_id, tvb, offset, 1,
+            (guint32)array_ptr[idx].via.u64);
+         idx++;
+      }
+
+      /* Row name (e.g., "Device.WiFi.AccessPoint.1" or "[alias]") */
+      if (idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+         gchar* row = wmem_strdup_printf(pinfo->pool, "%.*s",
+            (int)array_ptr[idx].via.str.size,
+            array_ptr[idx].via.str.ptr);
+         proto_tree_add_string(tree, hf_rbus_parameter_name, tvb, offset, 1, row);
          idx++;
       }
    } else if (strcmp(method, "METHOD_OPENDIRECT_CONN") == 0 ||
@@ -1504,15 +1786,25 @@ dissect_rbus(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree, void* data _U_
          /* Check if payload is JSON (starts with '{' or '[') */
          guint8 first_byte = tvb_get_uint8(tvb, offset);
          if ((first_byte == '{' || first_byte == '[') && actual_payload_length > 1) {
-            /* This is likely JSON, not MessagePack - display as string */
-            const guint8* json_data = tvb_get_ptr(tvb, offset, actual_payload_length);
-            gchar* json_str = (gchar*)wmem_alloc(pinfo->pool, actual_payload_length + 1);
-            memcpy(json_str, json_data, actual_payload_length);
-            json_str[actual_payload_length] = '\0';
+            /* This is likely JSON - check if it's a control message */
+            gint control_type = get_control_message_type(topic_str);
+            
+            if (control_type >= 0) {
+               /* Parse as control message with structured fields */
+               parse_control_message(tvb, pinfo, payload_tree, offset, actual_payload_length, control_type);
+               proto_item_append_text(payload_item, " [Control Message - JSON]");
+               col_append_str(pinfo->cinfo, COL_INFO, " (Control)");
+            } else {
+               /* Regular JSON payload - display as string */
+               const guint8* json_data = tvb_get_ptr(tvb, offset, actual_payload_length);
+               gchar* json_str = (gchar*)wmem_alloc(pinfo->pool, actual_payload_length + 1);
+               memcpy(json_str, json_data, actual_payload_length);
+               json_str[actual_payload_length] = '\0';
 
-            proto_tree_add_bytes_format_value(payload_tree, hf_rbus_payload, tvb, offset,
-               actual_payload_length, NULL, "%s", json_str);
-            proto_item_append_text(payload_item, " [JSON]");
+               proto_tree_add_bytes_format_value(payload_tree, hf_rbus_payload, tvb, offset,
+                  actual_payload_length, NULL, "%s", json_str);
+               proto_item_append_text(payload_item, " [JSON]");
+            }
          } else {
             /* Try structured RBus message parsing first */
             guint consumed = parse_rbus_payload(tvb, pinfo, payload_tree, offset, actual_payload_length);
@@ -2035,6 +2327,105 @@ proto_register_rbus(void) {
           FT_STRING, BASE_NONE, NULL, 0x0,
           "Event data property name and value for filtering", HFILL }
       },
+      /* Control message fields */
+      { &hf_rbus_control_message_type,
+        { "Control Message Type", "rbus.control.type",
+          FT_UINT32, BASE_DEC, VALS(rbus_control_msg_type_vals), 0x0,
+          "Type of router control message", HFILL }
+      },
+      { &hf_rbus_control_add,
+        { "Add/Remove", "rbus.control.add",
+          FT_INT32, BASE_DEC, NULL, 0x0,
+          "1=subscribe/add, 0=unsubscribe/remove", HFILL }
+      },
+      { &hf_rbus_control_topic,
+        { "Control Topic", "rbus.control.topic",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Topic for subscription operation", HFILL }
+      },
+      { &hf_rbus_control_route_id,
+        { "Route ID", "rbus.control.route_id",
+          FT_INT32, BASE_DEC, NULL, 0x0,
+          "Route identifier (typically 1)", HFILL }
+      },
+      { &hf_rbus_control_expression,
+        { "Expression", "rbus.control.expression",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Discovery expression or pattern", HFILL }
+      },
+      { &hf_rbus_control_result,
+        { "Result", "rbus.control.result",
+          FT_INT32, BASE_DEC, NULL, 0x0,
+          "Result status code (0=success)", HFILL }
+      },
+      { &hf_rbus_control_count,
+        { "Count", "rbus.control.count",
+          FT_UINT32, BASE_DEC, NULL, 0x0,
+          "Number of items in response", HFILL }
+      },
+      { &hf_rbus_control_item,
+        { "Item", "rbus.control.item",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Discovery result item", HFILL }
+      },
+      { &hf_rbus_advisory_event,
+        { "Advisory Event", "rbus.advisory.event",
+          FT_INT32, BASE_DEC, VALS(rbus_advisory_event_vals), 0x0,
+          "Advisory event type (connect/disconnect)", HFILL }
+      },
+      { &hf_rbus_advisory_inbox,
+        { "Inbox", "rbus.advisory.inbox",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Client inbox topic", HFILL }
+      },
+      { &hf_rbus_diag_command,
+        { "Diagnostic Command", "rbus.diag.command",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Router diagnostic command", HFILL }
+      },
+      /* Event metadata fields */
+      { &hf_rbus_event_object_name,
+        { "Object Name", "rbus.event.object_name",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Publishing component name (event metadata)", HFILL }
+      },
+      { &hf_rbus_event_is_rbus2,
+        { "Is RBus2", "rbus.event.is_rbus2",
+          FT_UINT32, BASE_DEC, NULL, 0x0,
+          "RBus version flag (always 1)", HFILL }
+      },
+      /* Element type and access fields (for discovery responses) */
+      { &hf_rbus_element_type,
+        { "Element Type", "rbus.element.type",
+          FT_UINT32, BASE_DEC, VALS(rbus_element_type_vals), 0x0,
+          "Type of element (property, table, event, method)", HFILL }
+      },
+      { &hf_rbus_element_access,
+        { "Access Flags", "rbus.element.access",
+          FT_UINT32, BASE_HEX, NULL, 0x0,
+          "Element access permissions (0x01=read, 0x02=write)", HFILL }
+      },
+      { &hf_rbus_discovery_depth,
+        { "Discovery Depth", "rbus.discovery.depth",
+          FT_INT32, BASE_DEC, NULL, 0x0,
+          "Recursion depth (0=single level, -1=unlimited)", HFILL }
+      },
+      { &hf_rbus_discovery_row_names_only,
+        { "Row Names Only", "rbus.discovery.row_names_only",
+          FT_UINT32, BASE_DEC, NULL, 0x0,
+          "Return table rows only (1=yes, 0=all elements)", HFILL }
+      },
+      /* Table operation fields */
+      { &hf_rbus_table_instance,
+        { "Instance Number", "rbus.table.instance",
+          FT_UINT32, BASE_DEC, NULL, 0x0,
+          "Table row instance number", HFILL }
+      },
+      { &hf_rbus_table_alias,
+        { "Alias", "rbus.table.alias",
+          FT_STRING, BASE_NONE, NULL, 0x0,
+          "Table row alias name", HFILL }
+      },
    };
 
    static gint* ett[] = {
@@ -2045,6 +2436,8 @@ proto_register_rbus(void) {
        &ett_rbus_parameter,
        &ett_rbus_property,
        &ett_rbus_metadata,
+       &ett_rbus_control,
+       &ett_rbus_event_metadata,
    };
 
    static ei_register_info ei[] = {

@@ -1,6 +1,27 @@
 # RBus Wire Protocol Documentation
 
-This document describes the RBus (RDK Bus) wire protocol based on analysis of the source code in `/rbus/`.
+This document describes the RBus (RDK Bus) wire protocol based on analysis of the source code in `/rbus/` and the official RBus WireProtocol specification.
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Protocol Stack](#protocol-stack)
+3. [Message Header (rtMessage)](#message-header-rtmessage)
+4. [MessagePack Payload](#messagepack-payload)
+5. [Control Messages](#control-messages)
+6. [Message Structures](#message-structures)
+7. [Data Type Encoding](#data-type-encoding)
+8. [Security Considerations](#security-considerations)
+9. [Appendix](#appendix)
+10. [Error Codes](#error-codes)
+11. [Result Code Calculation](#result-code-calculation)
+12. [Sessions and Transactions](#sessions-and-transactions)
+13. [OpenTelemetry Integration](#opentelemetry-integration)
+14. [Control Data Field](#control-data-field)
+15. [Example Packet Decodes](#example-packet-decodes)
+16. [Notes](#notes)
+17. [References](#references)
+
 
 ## Overview
 
@@ -158,6 +179,264 @@ The following method types are defined:
 | METHOD_OPENDIRECT_CONN          | Request   | Open direct connection                    |
 | METHOD_CLOSEDIRECT_CONN         | Request   | Close direct connection                   |
 | METHOD_RESPONSE                 | Response  | Response to any method                    |
+
+**Note on Success Codes**: Both 0 and 100 are treated as success in METHOD_RESPONSE messages. Implementations should check for `status == 0 || status == 100`.
+
+## Control Messages
+
+Control messages are sent between components and rtrouted to manage subscriptions and query routing information. They use JSON encoding in the payload (not MessagePack) and do not have the RawBinary flag set.
+
+### Subscribe/Unsubscribe Messages
+
+**RTMessage Envelope**:
+- Flags: `0x01` (Request, without RawBinary flag)
+- Topic: `_RTROUTED.INBOX.SUBSCRIBE` or similar router control topic
+- Payload Encoding: JSON (RFC 8259)
+
+**Subscribe Request**:
+```json
+{
+  "add": 1,
+  "topic": "<topic-to-subscribe>",
+  "route_id": 1
+}
+```
+
+**Unsubscribe Request**:
+```json
+{
+  "add": 0,
+  "topic": "<topic-to-unsubscribe>",
+  "route_id": 1
+}
+```
+
+**Field Definitions**:
+
+| Field    | Type    | Description                          |
+|----------|---------|--------------------------------------|
+| add      | integer | 1 = subscribe, 0 = unsubscribe       |
+| topic    | string  | Topic pattern to subscribe/unsubscribe |
+| route_id | integer | Route identifier (typically 1)       |
+
+**Note**: The `route_id` field is currently always set to 1 and is reserved for future routing enhancements.
+
+### Discovery Messages
+
+Discovery messages allow components to query the router's routing table to discover registered elements and components.
+
+#### Query Wildcard Destinations
+
+Resolves partial paths to discover matching registered topics.
+
+**RTMessage Envelope**:
+- Topic: `_RTROUTED.INBOX.QUERY`
+- Flags: `0x01` (Request)
+- Payload Encoding: JSON
+
+**Request Format**:
+```json
+{
+  "expression": "Device.WiFi."
+}
+```
+
+**Response Format**:
+```json
+{
+  "result": 0,
+  "count": 3,
+  "items": [
+    "Device.WiFi.SSID",
+    "Device.WiFi.Enable", 
+    "Device.WiFi.AccessPoint."
+  ]
+}
+```
+
+**Field Definitions**:
+
+| Field      | Type             | Description                      |
+|------------|------------------|----------------------------------|
+| expression | string           | Partial path or wildcard pattern |
+| result     | integer          | Status code (0=success)          |
+| count      | integer          | Number of matching topics        |
+| items      | array of strings | List of matching topic paths     |
+
+**Use Case**: Used when a component needs to discover what elements are registered under a partial path.
+
+#### Discover Object Elements
+
+Enumerates all topics registered for a specific route/component.
+
+**RTMessage Envelope**:
+- Topic: `_enumerate_elements`
+- Flags: `0x01` (Request)
+- Payload Encoding: JSON
+
+**Request Format**:
+```json
+{
+  "expression": "Device.WiFi.SSID"
+}
+```
+
+**Response Format**:
+```json
+{
+  "count": 5,
+  "items": [
+    "Device.WiFi.SSID",
+    "Device.WiFi.Enable",
+    "Device.WiFi.Channel",
+    "Device.WiFi.Standard",
+    "Device.WiFi.AccessPoint."
+  ]
+}
+```
+
+#### Discover Element Objects
+
+Reverse lookup: finds which route owns a specific topic.
+
+**RTMessage Envelope**:
+- Topic: `_trace_origin_object`
+- Flags: `0x01` (Request)
+- Payload Encoding: JSON
+
+**Request Format**:
+```json
+{
+  "expression": "Device.WiFi.SSID"
+}
+```
+
+**Response Format**:
+```json
+{
+  "count": 1,
+  "items": [
+    "Device.WiFi."
+  ]
+}
+```
+
+**Use Case**: Determines which provider component owns a specific element path.
+
+#### Discover Registered Components
+
+Lists all active component routes registered with the router.
+
+**RTMessage Envelope**:
+- Topic: `_registered_components`
+- Flags: `0x01` (Request)
+- Payload Encoding: JSON
+
+**Request Format**:
+```json
+{}
+```
+
+**Response Format**:
+```json
+{
+  "count": 4,
+  "items": [
+    "Device.WiFi.",
+    "Device.DeviceInfo.",
+    "Device.Logging.",
+    "Device.Time."
+  ]
+}
+```
+
+**Field Definitions**:
+
+| Field | Type             | Description                          |
+|-------|------------------|--------------------------------------|
+| count | integer          | Number of registered routes          |
+| items | array of strings | List of route expressions (excludes internal "_" prefixed routes) |
+
+**Note**: This only returns non-internal routes. Routes starting with "_" (router control topics) are filtered out.
+
+### Advisory Messages
+
+Advisory messages are broadcast by rtrouted to notify subscribers about client connection lifecycle events.
+
+**RTMessage Envelope**:
+- Topic: `_RTROUTED.ADVISORY`
+- Flags: `0x00` (no flags)
+- Payload Encoding: JSON
+
+**Advisory Event Format**:
+```json
+{
+  "event": 0,
+  "inbox": "rbus.component.INBOX.12345"
+}
+```
+
+**Field Definitions**:
+
+| Field | Type    | Description                                  |
+|-------|---------|----------------------------------------------|
+| event | integer | Event type (0=connect, 1=disconnect)         |
+| inbox | string  | Inbox topic of the connecting/disconnecting client |
+
+**Event Types**:
+
+| Code | Name                     | Description                              |
+|------|--------------------------|------------------------------------------|
+| 0    | rtAdviseClientConnect    | Component connected and registered inbox |
+| 1    | rtAdviseClientDisconnect | Component disconnected                   |
+
+**Use Case**: Components can subscribe to `_RTROUTED.ADVISORY` to monitor when other components join or leave the bus. This is useful for service discovery and graceful degradation.
+
+### Diagnostic Messages
+
+Diagnostic messages allow administrators to query router state and enable debugging features.
+
+**RTMessage Envelope**:
+- Topic: `_RTROUTED.INBOX.DIAG`
+- Flags: `0x01` (Request)
+- Payload Encoding: JSON
+
+**Diagnostic Commands**:
+
+| Command                  | Description                            |
+|--------------------------|----------------------------------------|
+| enableVerboseLogs        | Enable verbose logging in rtrouted     |
+| disableVerboseLogs       | Disable verbose logging                |
+| logRoutingStats          | Dump routing statistics to logs        |
+| logRoutingTopics         | List all registered topics             |
+| logRoutingRoutes         | List all active routes                 |
+| enableTrafficMonitor     | Enable message traffic monitoring      |
+| disableTrafficMonitor    | Disable traffic monitoring             |
+| resetBenchmarkData       | Clear performance benchmark counters   |
+| dumpBenchmarkData        | Output benchmark data to logs          |
+| heartbeat                | Check if router is responsive          |
+| shutdown                 | Gracefully shut down router            |
+
+**Request Format** (example):
+```json
+{
+  "_RTROUTED.INBOX.DIAG.KEY": "logRoutingStats"
+}
+```
+
+**Note**: Diagnostic messages are intended for debugging and administrative purposes only. Production code should not rely on these messages.
+
+### Router Control Topic Summary
+
+| Topic                          | Purpose                        | Request Format | Response Format    |
+|--------------------------------|--------------------------------|----------------|--------------------|
+| _RTROUTED.INBOX.SUBSCRIBE      | Manage subscriptions           | JSON           | JSON               |
+| _RTROUTED.INBOX.QUERY          | Discover wildcard destinations | JSON           | JSON               |
+| _enumerate_elements            | List route elements            | JSON           | JSON               |
+| _trace_origin_object           | Reverse route lookup           | JSON           | JSON               |
+| _registered_components         | List active components         | JSON           | JSON               |
+| _RTROUTED.ADVISORY             | Connection lifecycle events    | N/A            | JSON (broadcast)   |
+| _RTROUTED.INBOX.DIAG           | Diagnostic commands            | JSON           | Varies             |
 
 ### RBus Metadata Structure
 
@@ -326,6 +605,468 @@ The response structure depends on whether the operation succeeded or failed.
 | 4     | ot_parent      | string  | OpenTelemetry parent                          |
 | 5     | ot_state       | string  | OpenTelemetry state                           |
 | 6     | offset         | int32   | Offset to metadata                            |
+
+### METHOD_RPC / Invoke Operation (Request)
+
+Remote method invocation allows executing provider-defined methods with optional parameters.
+
+**Message Structure** (MessagePack-encoded):
+```
+[ sessionId, methodName, hasParams, params, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type                          | Description                                   |
+|-------|----------------|-------------------------------|-----------------------------------------------|
+| 0     | sessionId      | int                           | Session identifier (reserved, 0)              |
+| 1     | methodName     | string                        | Name of method to invoke                      |
+| 2     | hasParams      | int                           | 1 if params present, 0 otherwise              |
+| 3     | params         | MessagePack RBusObject        | Input parameters (if hasParams = 1)           |
+| 4     | method         | string                        | "METHOD_RPC"                                  |
+| 5     | ot_parent      | string                        | OpenTelemetry parent                          |
+| 6     | ot_state       | string                        | OpenTelemetry state                           |
+| 7     | offset         | int32                         | Offset to metadata (fixed 32-bit)             |
+
+**Response** (Success):
+```
+[ status, result, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type                          | Description                                   |
+|-------|----------------|-------------------------------|-----------------------------------------------|
+| 0     | status         | int                           | Result status (0 or 100 = success)            |
+| 1     | result         | MessagePack RBusObject        | Output result object                          |
+| 2     | method         | string                        | "METHOD_RESPONSE"                             |
+| 3     | ot_parent      | string                        | OpenTelemetry parent                          |
+| 4     | ot_state       | string                        | OpenTelemetry state                           |
+| 5     | offset         | int32                         | Offset to metadata                            |
+
+**Response** (Error):
+```
+[ status, method, ot_parent, ot_state, offset ]
+```
+
+### METHOD_SUBSCRIBE (Request)
+
+Subscribe to property change events or value-change notifications.
+
+**Message Structure** (MessagePack-encoded):
+```
+[ eventName, replyTopic, hasPayload, payload, publishOnSubscribe, rawDataSubscription, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field                | Type                    | Description                                             |
+|-------|----------------------|-------------------------|---------------------------------------------------------|
+| 0     | eventName            | string                  | Event/property name to monitor                          |
+| 1     | replyTopic           | string                  | Topic where events should be sent                       |
+| 2     | hasPayload           | int                     | Always 1 (payload present)                              |
+| 3     | payload              | MessagePack binary      | Subscription parameters (see below)                     |
+| 4     | publishOnSubscribe   | int                     | Send immediate event on subscribe (0=no, 1=yes)         |
+| 5     | rawDataSubscription  | int                     | Raw data mode (0=normal, 1=raw)                         |
+| 6     | method               | string                  | "METHOD_SUBSCRIBE"                                      |
+| 7     | ot_parent            | string                  | OpenTelemetry parent                                    |
+| 8     | ot_state             | string                  | OpenTelemetry state                                     |
+| 9     | offset               | int32                   | Offset to metadata (fixed 32-bit)                       |
+
+**Payload Fields** (MessagePack-encoded within binary payload):
+
+| Field        | Type    | Description                                          |
+|--------------|---------|------------------------------------------------------|
+| componentId  | int     | Component identifier (reserved, 0)                   |
+| interval     | int     | Polling interval in ms (0=change-based)              |
+| duration     | int     | Subscription duration (0=indefinite)                 |
+| hasFilter    | int     | Filter present flag (0=no filter)                    |
+
+**Response**:
+```
+[ status, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type    | Description                                   |
+|-------|----------------|---------|-----------------------------------------------|
+| 0     | status         | int     | Result status (0=success)                     |
+| 1     | method         | string  | "METHOD_RESPONSE"                             |
+| 2     | ot_parent      | string  | OpenTelemetry parent                          |
+| 3     | ot_state       | string  | OpenTelemetry state                           |
+| 4     | offset         | int32   | Offset to metadata                            |
+
+### METHOD_GETPARAMETERNAMES / Discovery (Request)
+
+Enumerate elements in the data model tree.
+
+**Message Structure** (MessagePack-encoded):
+```
+[ objectName, depth, getRowNamesOnly, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field            | Type    | Description                                             |
+|-------|------------------|---------|---------------------------------------------------------|
+| 0     | objectName       | string  | Root object for discovery (e.g., "Device.WiFi.")        |
+| 1     | depth            | int     | Recursion depth (0=single level, -1=unlimited)          |
+| 2     | getRowNamesOnly  | int     | 1=table rows only, 0=all elements                       |
+| 3     | method           | string  | "METHOD_GETPARAMETERNAMES"                              |
+| 4     | ot_parent        | string  | OpenTelemetry parent                                    |
+| 5     | ot_state         | string  | OpenTelemetry state                                     |
+| 6     | offset           | int32   | Offset to metadata                                      |
+
+**Note**: When `getRowNamesOnly=1`, the operation returns only table row instance numbers and aliases.
+
+**Response** (All Elements):
+```
+[ status, count, [name, type, access]×N, method, ot_parent, ot_state, offset ]
+```
+
+| Index  | Field          | Type    | Description                                             |
+|--------|----------------|---------|---------------------------------------------------------|
+| 0      | status         | int     | Result status (0=success)                               |
+| 1      | count          | int     | Number of elements found                                |
+| 2+3×i  | name           | string  | Full path of element (e.g., "Device.WiFi.SSID")         |
+| 3+3×i  | type           | int     | Element type (see below)                                |
+| 4+3×i  | access         | int     | Access permissions (read/write flags)                   |
+| 2+3×N  | method         | string  | "METHOD_RESPONSE"                                       |
+| 3+3×N  | ot_parent      | string  | OpenTelemetry parent                                    |
+| 4+3×N  | ot_state       | string  | OpenTelemetry state                                     |
+| 5+3×N  | offset         | int32   | Offset to metadata                                      |
+
+**Element Types** (rbusElementType_t):
+
+| Code | Name                       | Description              |
+|------|----------------------------|--------------------------|
+| 0    | RBUS_ELEMENT_TYPE_PROPERTY | Leaf property value      |
+| 1    | RBUS_ELEMENT_TYPE_TABLE    | Multi-instance table     |
+| 2    | RBUS_ELEMENT_TYPE_EVENT    | Event source             |
+| 3    | RBUS_ELEMENT_TYPE_METHOD   | Invocable method         |
+
+**Access Flags**:
+
+| Bit  | Name  | Description              |
+|------|-------|--------------------------|
+| 0x01 | Read  | Property can be read     |
+| 0x02 | Write | Property can be written  |
+
+**Response** (Row Names Only - when getRowNamesOnly=1):
+```
+[ status, count, [instanceNumber, alias]×N, method, ot_parent, ot_state, offset ]
+```
+
+### Table Operations
+
+Table operations allow dynamic creation and deletion of table rows in the data model. Tables represent multi-instance objects (e.g., "Device.WiFi.AccessPoint.{i}").
+
+#### Add Table Row (METHOD_ADDTBLROW)
+
+**Request**:
+```
+[ sessionId, tableName, aliasName, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type    | Description                                             |
+|-------|----------------|---------|---------------------------------------------------------|
+| 0     | sessionId      | int     | Session identifier (reserved, 0)                        |
+| 1     | tableName      | string  | Name of table (e.g., "Device.WiFi.AccessPoint.")        |
+| 2     | aliasName      | string  | Optional alias for new row (empty string if not used)   |
+| 3     | method         | string  | "METHOD_ADDTBLROW"                                      |
+| 4     | ot_parent      | string  | OpenTelemetry parent                                    |
+| 5     | ot_state       | string  | OpenTelemetry state                                     |
+| 6     | offset         | int32   | Offset to metadata                                      |
+
+**Note**: The `tableName` MUST end with a period (e.g., "Device.WiFi.AccessPoint.").
+
+**Response**:
+```
+[ status, instanceNumber, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type    | Description                                   |
+|-------|----------------|---------|-----------------------------------------------|
+| 0     | status         | int     | Result status (0=success)                     |
+| 1     | instanceNumber | int     | Assigned instance number for new row          |
+| 2     | method         | string  | "METHOD_RESPONSE"                             |
+| 3     | ot_parent      | string  | OpenTelemetry parent                          |
+| 4     | ot_state       | string  | OpenTelemetry state                           |
+| 5     | offset         | int32   | Offset to metadata                            |
+
+**Instance Numbering**:
+- Providers assign unique instance numbers to each row
+- Instance numbers SHOULD be monotonically increasing
+- Rows can be accessed by instance number: "Device.WiFi.AccessPoint.1"
+- Rows can also be accessed by alias if provided: "Device.WiFi.AccessPoint.[home_network]"
+
+#### Remove Table Row (METHOD_DELETETBLROW)
+
+**Request**:
+```
+[ sessionId, rowName, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type    | Description                                             |
+|-------|----------------|---------|---------------------------------------------------------|
+| 0     | sessionId      | int     | Session identifier (reserved, 0)                        |
+| 1     | rowName        | string  | Fully qualified row name                                |
+| 2     | method         | string  | "METHOD_DELETETBLROW"                                   |
+| 3     | ot_parent      | string  | OpenTelemetry parent                                    |
+| 4     | ot_state       | string  | OpenTelemetry state                                     |
+| 5     | offset         | int32   | Offset to metadata                                      |
+
+**Row Naming Formats**:
+- By instance number: "Device.WiFi.AccessPoint.1"
+- By alias: "Device.WiFi.AccessPoint.[home_network]"
+
+**Response**:
+```
+[ status, method, ot_parent, ot_state, offset ]
+```
+
+| Index | Field          | Type    | Description                                   |
+|-------|----------------|---------|-----------------------------------------------|
+| 0     | status         | int     | Result status (0=success)                     |
+| 1     | method         | string  | "METHOD_RESPONSE"                             |
+| 2     | ot_parent      | string  | OpenTelemetry parent                          |
+| 3     | ot_state       | string  | OpenTelemetry state                           |
+| 4     | offset         | int32   | Offset to metadata                            |
+
+### Event Messages
+
+Events are published to subscribers when values change or events occur.
+
+**IMPORTANT**: Event messages use a **different metadata structure** than other RBus messages.
+
+**Message Structure** (MessagePack-encoded):
+```
+[ eventName, eventType, hasData, data, hasFilter, interval, duration, componentId, eventMetadata ]
+```
+
+| Index | Field          | Type                          | Description                                   |
+|-------|----------------|-------------------------------|-----------------------------------------------|
+| 0     | eventName      | string                        | Name of the event being published             |
+| 1     | eventType      | int                           | Event type (3 = general event)                |
+| 2     | hasData        | int                           | 1 if event data present, 0 otherwise          |
+| 3     | data           | MessagePack RBusObject        | Event data payload (if hasData = 1)           |
+| 4     | hasFilter      | int                           | Filter applied flag (reserved, 0)             |
+| 5     | interval       | int                           | Event interval (reserved, 0)                  |
+| 6     | duration       | int                           | Event duration (reserved, 0)                  |
+| 7     | componentId    | int                           | Publishing component ID                       |
+| N-4   | eventName2     | string                        | Event name (repeated from metadata)           |
+| N-3   | objectName     | string                        | Publishing component name                     |
+| N-2   | isRbus2        | int                           | RBus version flag (always 1)                  |
+| N-1   | offset         | int32                         | Byte offset to metadata (fixed 32-bit)        |
+
+**Event Metadata Structure** (DIFFERENT from normal metadata):
+```
+[ eventName, objectName, isRbus2, offset ]
+```
+
+| Field      | Type   | Description                                          |
+|------------|--------|------------------------------------------------------|
+| eventName  | string | Event name (matches eventName in body)               |
+| objectName | string | Publishing component name                            |
+| isRbus2    | int    | RBus version flag (always 1)                         |
+| offset     | int32  | Byte offset to metadata (MUST use fixed 32-bit encoding 0xd2) |
+
+**Critical Difference**: Events do NOT use the standard `[method, ot_parent, ot_state, offset]` metadata. They use the special event metadata format shown above.
+
+## Data Type Encoding
+
+All RBus data types use MessagePack encoding with specific conventions.
+
+### String Encoding
+
+Strings are encoded as MessagePack strings (fixstr, str8, str16, or str32).
+
+**Encoding**:
+1. Write MessagePack string header
+2. Write UTF-8 bytes
+3. No null terminator in MessagePack
+
+**Wire Format**:
+```
+[MessagePack Str Header][UTF-8 Bytes]
+```
+
+### RBusValue Encoding
+
+RBus values use a two-part encoding: type ID followed by value.
+
+#### Type Encoding Rules
+
+**Binary Encoding Types**: The following types encode their value as MessagePack binary (not integer):
+- None, Boolean, Char, Int8, UInt8, String, Bytes
+
+**Integer Encoding**: Int16 through UInt32 use MessagePack variable-length integer encoding.
+
+**Fixed-Width Encoding**: Int64 and UInt64 MUST use MessagePack fixed 64-bit encoding (0xd3).
+
+**Float Encoding**: Single values are promoted to double-precision for encoding.
+
+**String Termination**: String type (0x50E) includes a null terminator byte after the UTF-8 data.
+
+#### Encoding Examples
+
+**Boolean True**:
+```
+[MessagePack Int: 0x500][MessagePack Bin8: 0xc4 0x01 0x01]
+                                          │   │   │
+                                          │   │   └─ value: 0x01 (true)
+                                          │   └───── length: 1
+                                          └───────── bin8 marker
+```
+
+**Int32 Value 42**:
+```
+[MessagePack Int: 0x507][MessagePack Int: 42]
+```
+
+**String "hello"**:
+```
+[MessagePack Int: 0x50E][MessagePack Bin8: 0xc4 0x06 'h' 'e' 'l' 'l' 'o' 0x00]
+                                          │   │    └─────┬─────┘ │
+                                          │   │          │       └─ null terminator
+                                          │   └────────── length: 6
+                                          └────────────── bin8 marker
+```
+
+### RBusProperty Encoding
+
+A property is a name-value pair.
+
+**MessagePack Encoding**:
+```
+┌─────────────────────────────────────┐
+│  name (MessagePack string)          │
+├─────────────────────────────────────┤
+│  value (MessagePack-encoded RBusValue)│
+└─────────────────────────────────────┘
+```
+
+**Example**:
+```
+Property: name="temperature", value=Int32(25)
+
+MessagePack wire bytes:
+[MessagePack Str: "temperature"][Type ID: 0x507][MessagePack Int: 25]
+```
+
+### RBusObject Encoding
+
+An object is a named collection of properties.
+
+**MessagePack Encoding**:
+```
+┌─────────────────────────────────────┐
+│  name (MessagePack string)          │
+├─────────────────────────────────────┤
+│  object_type (MessagePack int) = 0  │
+├─────────────────────────────────────┤
+│  property_count (MessagePack int)   │
+├─────────────────────────────────────┤
+│  properties (MessagePack RBusProperty[])│
+├─────────────────────────────────────┤
+│  children_count (MessagePack int) = 0│
+└─────────────────────────────────────┘
+```
+
+**Field Descriptions**:
+
+| Field          | Type                  | Description                              |
+|----------------|-----------------------|------------------------------------------|
+| name           | MessagePack string    | Object name identifier                   |
+| object_type    | MessagePack integer   | Object type (0=single instance)          |
+| property_count | MessagePack integer   | Number of properties that follow         |
+| properties     | MessagePack array     | MessagePack-encoded RBusProperty elements |
+| children_count | MessagePack integer   | Number of child objects (always 0)       |
+
+**Example**:
+```
+Object: name="ThermostatData"
+  properties:
+    - name="temperature", value=Int32(25)
+    - name="humidity", value=Int32(60)
+
+MessagePack wire bytes:
+[MessagePack Str: "ThermostatData"]
+[MessagePack Int: 0]                    // object_type
+[MessagePack Int: 2]                    // property_count
+  [MessagePack Str: "temperature"][Type: 0x507][MessagePack Int: 25]
+  [MessagePack Str: "humidity"][Type: 0x507][MessagePack Int: 60]
+[MessagePack Int: 0]                    // children_count
+```
+
+## Security Considerations
+
+### Access Control
+
+- Socket permissions on `/tmp/rtrouted` control access
+- No built-in authentication mechanism
+- Relies on Unix file permissions for security
+
+### Data Validation
+
+Implementations MUST validate:
+- Header markers (both 0xAAAA) and version (2)
+- Field lengths against maximum limits
+- MessagePack structure integrity
+- UTF-8 string encoding validity
+
+### Resource Limits
+
+To prevent denial-of-service:
+- Topic length ≤ 256 bytes
+- Reply topic length ≤ 256 bytes
+- Payload length should be bounded (implementation-specific)
+- Message rate limiting recommended
+
+### Encryption
+
+The Encrypted flag (0x20) is defined but:
+- Encryption format is implementation-specific
+- No standard encryption scheme defined
+- End-to-end encryption must be implemented separately
+
+## Appendix
+
+### Compliance Checklist
+
+Implementations MUST:
+- ✓ Validate both 0xAAAA header markers
+- ✓ Use version 2 in all messages
+- ✓ Encode all integers in big-endian
+- ✓ Set RawBinary flag for MessagePack payloads
+- ✓ Encode metadata offset as fixed 32-bit integer (0xd2)
+- ✓ Include null terminator in String type (0x50E) values
+- ✓ Validate topic lengths ≤ 256 bytes
+- ✓ Support all defined RBusValue types (including CCSP types)
+- ✓ Handle both status codes 0 and 100 as success
+
+Implementations SHOULD:
+- Implement connection retry logic
+- Rate-limit message sending
+- Validate MessagePack structure
+- Log malformed messages for debugging
+- Implement graceful shutdown
+- Clean up subscriptions on disconnect
+
+### MessagePack Quick Reference
+
+| Type     | Format Byte     | Description                  |
+|----------|-----------------|------------------------------|
+| fixint   | 0x00-0x7f       | Positive integer 0-127       |
+| fixstr   | 0xa0-0xbf       | String length 0-31           |
+| nil      | 0xc0            | Null value                   |
+| false    | 0xc2            | Boolean false                |
+| true     | 0xc3            | Boolean true                 |
+| bin8     | 0xc4            | Binary, 1-byte length        |
+| bin16    | 0xc5            | Binary, 2-byte length        |
+| bin32    | 0xc6            | Binary, 4-byte length        |
+| float64  | 0xcb            | 64-bit IEEE 754 float        |
+| uint8    | 0xcc            | 8-bit unsigned               |
+| uint16   | 0xcd            | 16-bit unsigned              |
+| uint32   | 0xce            | 32-bit unsigned              |
+| int8     | 0xd0            | 8-bit signed                 |
+| int16    | 0xd1            | 16-bit signed                |
+| int32    | 0xd2            | 32-bit signed                |
+| int64    | 0xd3            | 64-bit signed                |
+| str8     | 0xd9            | String, 1-byte length        |
+| str16    | 0xda            | String, 2-byte length        |
+| str32    | 0xdb            | String, 4-byte length        |
 
 ## Error Codes
 
@@ -578,10 +1319,24 @@ Payload (MessagePack):
 
 ## References
 
-- Source files analyzed:
-  - `/rbus/src/rtmessage/rtMessageHeader.h`
-  - `/rbus/src/rtmessage/rtMessageHeader.c`
-  - `/rbus/src/core/rbuscore_types.h`
-  - `/rbus/include/rbus.h`
-  - `/rbus/include/rbus_value.h`
-  - `/rbus/src/rbus/rbus.c`
+### Official Documentation
+- **RBus GitHub Repository**: [https://github.com/rdkcentral/rbus](https://github.com/rdkcentral/rbus)
+- **RBus Wire Protocol Specification**: [https://github.com/cbucht200/rbus/blob/develop/docs/WireProtocol.md](https://github.com/cbucht200/rbus/blob/develop/docs/WireProtocol.md)
+- **MessagePack Specification**: [https://github.com/msgpack/msgpack/blob/master/spec.md](https://github.com/msgpack/msgpack/blob/master/spec.md)
+- **JSON Specification**: RFC 8259
+- **Unix Domain Sockets**: POSIX.1-2001
+
+### Source Files Analyzed
+- `/rbus/src/rtmessage/rtMessageHeader.h`
+- `/rbus/src/rtmessage/rtMessageHeader.c`
+- `/rbus/src/core/rbuscore_types.h`
+- `/rbus/include/rbus.h`
+- `/rbus/include/rbus_value.h`
+- `/rbus/src/rbus/rbus.c`
+
+### Version History
+
+| Version | Date    | Notes                                                           |
+|---------|---------|----------------------------------------------------------------|
+| 2.0     | 2026-02 | Updated with complete specification including control messages and data type encoding |
+| 1.0     | 2026-01 | Initial specification based on source code analysis            |
