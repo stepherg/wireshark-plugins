@@ -157,6 +157,14 @@ static const value_string rbus_event_type_vals[] = {
 
 /* RBus Value Type IDs */
 static const value_string rbus_type_vals[] = {
+    /* CCSP/TR-181 Data Model Types (legacy, 0-5 range) */
+    { 0x00, "String" },
+    { 0x01, "Int" },
+    { 0x02, "UnsignedInt" },
+    { 0x03, "Boolean" },
+    { 0x04, "DateTime" },
+    { 0x05, "Base64" },
+    /* RBus Native Types (0x500+ range) */
     { 0x500, "Boolean" },
     { 0x501, "Char" },
     { 0x503, "Int8" },
@@ -1174,89 +1182,105 @@ parse_rbus_payload(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
          idx++;
       }
 
-      /* If error, next field might be failed element name */
-      if (error_code != 0 && idx < (guint)method_idx && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-         gchar* failed = wmem_strdup_printf(pinfo->pool, "%.*s",
-            (int)array_ptr[idx].via.str.size,
-            array_ptr[idx].via.str.ptr);
-         proto_tree_add_string(tree, hf_rbus_failed_element, tvb, offset, 1, failed);
-         idx++;
-      }
-      /* If success, check if properties are present */
-      else if (error_code == 0 && idx < (guint)method_idx) {
-         /* Look for property count: an integer that's followed by the expected structure
-          * This handles new protocol fields between error code and property count */
-         guint32 prop_count = 0;
-         gboolean found_prop_count = FALSE;
-         
-         while (idx < (guint)method_idx && !found_prop_count) {
-            if ((array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER || 
-                 array_ptr[idx].type == MSGPACK_OBJECT_NEGATIVE_INTEGER)) {
-               guint32 potential_count = (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) ? 
-                                         (guint32)array_ptr[idx].via.u64 : 
-                                         (guint32)array_ptr[idx].via.i64;
-               
-               /* Verify this looks like a property count by checking if next field matches expectations:
-                * - If count > 0: next field should be a string (property name)
-                * - If count == 0: should be near the METHOD_ field */
-               if (potential_count > 0 && idx + 1 < (guint)method_idx && 
-                   array_ptr[idx + 1].type == MSGPACK_OBJECT_STR) {
-                  /* Non-zero count followed by string - this is the property count */
-                  prop_count = potential_count;
-                  found_prop_count = TRUE;
-                  proto_tree_add_uint(tree, hf_rbus_property_count, tvb, offset, 1, prop_count);
+      /* Try to find and parse properties regardless of error code.
+       * Some responses may include property data even with non-zero error codes. */
+      if (idx < (guint)method_idx) {
+         /* First, check if next field is a failed element name string (for simple error responses) */
+         gboolean is_simple_error = FALSE;
+         if (error_code != 0 && array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+            /* Check if this looks like a failed element name by seeing if the string after is METHOD_ */
+            if (idx + 1 < (guint)method_idx && array_ptr[idx + 1].type == MSGPACK_OBJECT_STR) {
+               gchar* next_str = wmem_strdup_printf(pinfo->pool, "%.*s",
+                  (int)array_ptr[idx + 1].via.str.size,
+                  array_ptr[idx + 1].via.str.ptr);
+               if (strncmp(next_str, "METHOD_", 7) == 0) {
+                  /* This is a simple error response with just a failed element name */
+                  is_simple_error = TRUE;
+                  gchar* failed = wmem_strdup_printf(pinfo->pool, "%.*s",
+                     (int)array_ptr[idx].via.str.size,
+                     array_ptr[idx].via.str.ptr);
+                  proto_tree_add_string(tree, hf_rbus_failed_element, tvb, offset, 1, failed);
                   idx++;
-                  break;
-               } else if (potential_count == 0 && idx + 1 < (guint)method_idx && 
-                          array_ptr[idx + 1].type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
-                          array_ptr[idx + 1].type != MSGPACK_OBJECT_NEGATIVE_INTEGER) {
-                  /* Zero count not followed by another integer - likely the property count */
-                  prop_count = 0;
-                  found_prop_count = TRUE;
-                  proto_tree_add_uint(tree, hf_rbus_property_count, tvb, offset, 1, prop_count);
-                  idx++;
-                  break;
                }
             }
-            idx++;
          }
 
-         /* Parse properties (triplets: name, type, value) */
-         for (guint32 p = 0; p < prop_count && idx + 2 <= (guint)method_idx; p++) {
-            proto_item* prop_item = proto_tree_add_item(tree, hf_rbus_property, tvb, offset, 1, ENC_NA);
-            proto_tree* prop_tree = proto_item_add_subtree(prop_item, ett_rbus_property);
-
-            /* Name */
-            gchar* name = NULL;
-            if (array_ptr[idx].type == MSGPACK_OBJECT_STR) {
-               name = wmem_strdup_printf(pinfo->pool, "%.*s",
-                  (int)array_ptr[idx].via.str.size,
-                  array_ptr[idx].via.str.ptr);
-               proto_tree_add_string(prop_tree, hf_rbus_property_name, tvb, offset, 1, name);
-               proto_item_append_text(prop_item, ": %s", name);
-            }
-            idx++;
-
-            /* Type */
-            guint32 type_id = 0;
-            if (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
-               type_id = (guint32)array_ptr[idx].via.u64;
-               proto_tree_add_uint(prop_tree, hf_rbus_property_type, tvb, offset, 1, type_id);
-            }
-            idx++;
-
-            /* Value */
-            gchar* value_str = NULL;
-            if (idx < (guint)method_idx) {
-               value_str = add_typed_value(prop_tree, tvb, pinfo, offset, &array_ptr[idx], TRUE);
-
-               /* Add synthetic namevalue field for filtering */
-               if (name && value_str) {
-                  gchar* namevalue = wmem_strdup_printf(pinfo->pool, "%s=%s", name, value_str);
-                  proto_tree_add_string(prop_tree, hf_rbus_property_namevalue, tvb, offset, 1, namevalue);
+         /* If not a simple error response, look for property count */
+         if (!is_simple_error) {
+            /* Look for property count: an integer that's followed by the expected structure
+             * This handles new protocol fields between error code and property count */
+            guint32 prop_count = 0;
+            gboolean found_prop_count = FALSE;
+            
+            while (idx < (guint)method_idx && !found_prop_count) {
+               if ((array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER || 
+                    array_ptr[idx].type == MSGPACK_OBJECT_NEGATIVE_INTEGER)) {
+                  guint32 potential_count = (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) ? 
+                                            (guint32)array_ptr[idx].via.u64 : 
+                                            (guint32)array_ptr[idx].via.i64;
+                  
+                  /* Verify this looks like a property count by checking if next field matches expectations:
+                   * - If count > 0: next field should be a string (property name)
+                   * - If count == 0: should be near the METHOD_ field */
+                  if (potential_count > 0 && idx + 1 < (guint)method_idx && 
+                      array_ptr[idx + 1].type == MSGPACK_OBJECT_STR) {
+                     /* Non-zero count followed by string - this is the property count */
+                     prop_count = potential_count;
+                     found_prop_count = TRUE;
+                     proto_tree_add_uint(tree, hf_rbus_property_count, tvb, offset, 1, prop_count);
+                     idx++;
+                     break;
+                  } else if (potential_count == 0 && idx + 1 < (guint)method_idx && 
+                             array_ptr[idx + 1].type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
+                             array_ptr[idx + 1].type != MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+                     /* Zero count not followed by another integer - likely the property count */
+                     prop_count = 0;
+                     found_prop_count = TRUE;
+                     proto_tree_add_uint(tree, hf_rbus_property_count, tvb, offset, 1, prop_count);
+                     idx++;
+                     break;
+                  }
                }
+               idx++;
             }
-            idx++;
+
+            /* Parse properties (triplets: name, type, value) */
+            for (guint32 p = 0; p < prop_count && idx + 2 <= (guint)method_idx; p++) {
+               proto_item* prop_item = proto_tree_add_item(tree, hf_rbus_property, tvb, offset, 1, ENC_NA);
+               proto_tree* prop_tree = proto_item_add_subtree(prop_item, ett_rbus_property);
+
+               /* Name */
+               gchar* name = NULL;
+               if (array_ptr[idx].type == MSGPACK_OBJECT_STR) {
+                  name = wmem_strdup_printf(pinfo->pool, "%.*s",
+                     (int)array_ptr[idx].via.str.size,
+                     array_ptr[idx].via.str.ptr);
+                  proto_tree_add_string(prop_tree, hf_rbus_property_name, tvb, offset, 1, name);
+                  proto_item_append_text(prop_item, ": %s", name);
+               }
+               idx++;
+
+               /* Type */
+               guint32 type_id = 0;
+               if (array_ptr[idx].type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                  type_id = (guint32)array_ptr[idx].via.u64;
+                  proto_tree_add_uint(prop_tree, hf_rbus_property_type, tvb, offset, 1, type_id);
+               }
+               idx++;
+
+               /* Value */
+               gchar* value_str = NULL;
+               if (idx < (guint)method_idx) {
+                  value_str = add_typed_value(prop_tree, tvb, pinfo, offset, &array_ptr[idx], TRUE);
+
+                  /* Add synthetic namevalue field for filtering */
+                  if (name && value_str) {
+                     gchar* namevalue = wmem_strdup_printf(pinfo->pool, "%s=%s", name, value_str);
+                     proto_tree_add_string(prop_tree, hf_rbus_property_namevalue, tvb, offset, 1, namevalue);
+                  }
+               }
+               idx++;
+            }
          }
       }
    }

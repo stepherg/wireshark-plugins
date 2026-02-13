@@ -97,7 +97,24 @@ The payload is encoded using MessagePack format. The structure varies by method 
 
 ### RBus Value Types
 
-RBus defines these value types (starting at 0x500):
+RBus supports two type systems:
+
+**CCSP/TR-181 Data Model Types (Legacy, 0x00-0x05):**
+
+Used by legacy CCSP components and TR-181 data model implementations:
+
+| Type ID | Name          | Description                      |
+|---------|---------------|----------------------------------|
+| 0x00    | ccsp_string   | String value                     |
+| 0x01    | ccsp_int      | Signed integer                   |
+| 0x02    | ccsp_unsignedInt | Unsigned integer              |
+| 0x03    | ccsp_boolean  | Boolean value                    |
+| 0x04    | ccsp_dateTime | Date/Time value                  |
+| 0x05    | ccsp_base64   | Base64 encoded data              |
+
+**RBus Native Types (0x500-0x512):**
+
+Native RBus type system with fine-grained type control:
 
 | Type ID | Name          | Description                      |
 |---------|---------------|----------------------------------|
